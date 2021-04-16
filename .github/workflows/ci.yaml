@@ -1,0 +1,87 @@
+name: CI
+
+on: 
+  workflow_dispatch:
+  schedule:
+    - cron:  '*/30 * * * *'
+
+jobs:
+  check:
+    name: Check Upstream
+    runs-on: ubuntu-20.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.check-upstream.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - name: Check upstream
+        id: check-upstream
+        run: |
+          set -xe
+          # list all the version tags on the go-ethereum repo
+          git ls-remote -t --refs --sort=v:refname https://github.com/ethereum/go-ethereum.git 'v*[0-9].*[0-9].*[0-9]' | cut -d'/' -f3 | while read -r tag; do
+            if ! git rev-parse --verify -q ${tag} >/dev/null; then
+              # tag this repo to track which tags have already been built
+              git tag ${tag} && git push --tags
+
+              # set the output with the tag we want to build and exit
+              echo "::set-output name=tag::${tag}" && exit 0
+            fi
+          done
+  build:
+    name: Build
+    needs:
+      - check
+    if: needs.check.outputs.tag != ''
+    runs-on: ubuntu-20.04
+    timeout-minutes: 60
+    strategy:
+      matrix:
+       include:
+         - id: geth
+           dockerfile: Dockerfile
+         - id: alltools
+           dockerfile: Dockerfile.alltools
+           tag-prefix: "alltools-"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          repository: ethereum/go-ethereum
+          ref: ${{ needs.check.outputs.tag }}
+          fetch-depth: 1
+      - name: Docker Cache
+        uses: actions/cache@v2
+        with:
+          path: /dev/shm/buildx-cache
+          key: buildx-${{ matrix.id }}-${{ github.sha }}
+          restore-keys: |
+            buildx-${{ matrix.id }}-
+      - name: Docker Build
+        run: |
+          set -xe
+          # login to the docker registry
+          echo "${{ secrets.DOCKER_TOKEN }}" | docker login --username cgtools --password-stdin
+
+          # use buildx's docker-container driver (for caching and multi-arch build support)
+          docker buildx create --use --name builder --driver docker-container
+
+          # avoid an ever growing docker layer cache
+          mkdir -p "/dev/shm/buildx-cache"
+          mv "/dev/shm/buildx-cache" "/dev/shm/buildx-cache-from"
+
+          # build the images
+          docker run --rm --privileged linuxkit/binfmt:v0.8
+          docker buildx build \
+            --file "${docker_files[$i]}" \
+            --platform linux/amd64,linux/arm64 \
+            --cache-from "type=local,src=/dev/shm/buildx-cache-from" \
+            --cache-to "type=local,dest=/dev/shm/buildx-cache,mode=max" \
+            --tag curvegrid/ethereum-client-go:${{ matrix.tag-prefix }}${{ needs.check.outputs.tag }} \
+            --tag curvegrid/ethereum-client-go:${{ matrix.tag-prefix }}latest \
+            --tag curvegrid/ethereum-client-go:${{ matrix.tag-prefix }}stable \
+            --push \
+            .
